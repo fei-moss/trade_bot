@@ -1,0 +1,28 @@
+# 策略发现工厂配置
+
+data:
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+  timeframe: "1h"
+  days: 120        # 4个月
+  exchange: binance
+
+generation:
+  target_bots: 100
+  generate_count: 150   # 多生成50%用于筛选
+  model: claude-sonnet-4-20250514
+
+backtest:
+  initial_capital: 10000
+  commission_rate: 0.001  # 0.1% 手续费 (待实现)
+
+diversity:
+  min_trades: 5           # 最少交易次数
+  n_clusters: 20          # 聚类数
+  target_diversity: 0.6   # 目标多样性分数
+
+output:
+  directory: profiles
+  format: json
