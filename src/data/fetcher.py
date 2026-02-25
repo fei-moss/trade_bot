@@ -11,14 +11,20 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import ccxt
 import pandas as pd
+
+try:
+    import ccxt
+except ImportError:
+    ccxt = None
 
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_cache")
 
 
-def get_exchange(exchange_id: str = "binance") -> ccxt.Exchange:
+def get_exchange(exchange_id: str = "binance"):
+    if ccxt is None:
+        raise ImportError("ccxt is required for live data fetching. Install: pip install ccxt")
     exchange_class = getattr(ccxt, exchange_id)
     return exchange_class({"enableRateLimit": True})
 
@@ -49,11 +55,22 @@ def fetch_ohlcv(
         f"{exchange_id}_{symbol.replace('/', '_')}_{timeframe}_{days}d.csv"
     )
 
-    # 检查缓存（24小时内有效）
+    # 检查精确匹配的缓存
     if use_cache and os.path.exists(cache_file):
         mod_time = os.path.getmtime(cache_file)
         if time.time() - mod_time < 86400:
             return pd.read_csv(cache_file, parse_dates=["timestamp"])
+
+    # 模糊匹配：查找同交易对/周期但不同天数的缓存
+    if use_cache:
+        import glob
+        prefix = f"{exchange_id}_{symbol.replace('/', '_')}_{timeframe}_"
+        pattern = os.path.join(DATA_DIR, f"{prefix}*d.csv")
+        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        if matches:
+            best = matches[0]
+            print(f"Using cached file: {os.path.basename(best)}")
+            return pd.read_csv(best, parse_dates=["timestamp"])
 
     exchange = get_exchange(exchange_id)
     since = exchange.parse8601((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())

@@ -1,4 +1,4 @@
-# 策略发现工厂配置
+# 策略发现工厂 v2.0 配置
 
 data:
   symbols:
@@ -12,16 +12,31 @@ data:
 generation:
   target_bots: 100
   generate_count: 150   # 多生成50%用于筛选
-  model: claude-sonnet-4-20250514
+
+regime:
+  version: v1           # v1=ADX+MA, v2=ATR+Vol, v3=多指标投票
+  window: 48
 
 backtest:
   initial_capital: 10000
   commission_rate: 0.001  # 0.1% 手续费 (待实现)
 
 diversity:
-  min_trades: 5           # 最少交易次数
-  n_clusters: 20          # 聚类数
-  target_diversity: 0.6   # 目标多样性分数
+  min_trades: 5
+  n_clusters: 20
+  weight_similarity_threshold: 0.95  # 权重相似度>此值视为重复
+
+evolution:
+  elite_pct: 0.2
+  mutation_rate: 0.2
+  crossover_rate: 0.5
+  default_fitness: Sharpe
+
+llm:
+  base_url: "https://openrouter.ai/api/v1"
+  model: "anthropic/claude-sonnet-4.6"
+  max_tokens: 4096
+  temperature: 0.7
 
 output:
   directory: profiles

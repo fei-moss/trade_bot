@@ -1,0 +1,10 @@
+services:
+  trade-bot:
+    build: .
+    container_name: trade-bot
+    volumes:
+      - ./profiles:/app/profiles
+      - ./data_cache:/app/data_cache
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}

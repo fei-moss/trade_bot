@@ -10,8 +10,11 @@ build/
 # Data cache
 data_cache/
 
-# Generated profiles (keep directory, ignore contents)
+# Generated profiles & evolution data
 profiles/*.json
+profiles/gen_*/
+profiles/dashboard.html
+profiles_test/
 
 # Environment
 .env

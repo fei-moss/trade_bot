@@ -1,280 +1,294 @@
 """
-信号生成引擎
+权重向量 → 交易信号 翻译器
 
-将策略配置(BotStrategy)中的entry/exit条件翻译成具体的买卖信号序列。
+将42维权重向量翻译为具体的买卖信号序列。
+核心流程:
+1. 根据 indicator_set 计算对应指标
+2. 根据 entry_condition 组合信号 (Strict=AND, Loose=OR, ...)
+3. 根据 entry_confirmation 确认信号
+4. 根据 regime_focus 过滤信号
+5. 应用 reverse_logic_prob 随机反转
 """
 
 import pandas as pd
 import numpy as np
-from src.strategy.schema import BotStrategy, IndicatorCondition, EntryRule
-from src.strategy.indicators import compute_indicator
+from src.strategy.schema import WeightVector, parse_ma_range
+from src.strategy.indicators import (
+    ema, sma, rsi, macd, bollinger_bands, bollinger_width, atr, adx,
+    stochastic, supertrend, vwap, obv, volume_spike, price_breakout,
+    keltner_channels, ichimoku, cci, mfi,
+    compute_indicator,
+)
 
 
-def evaluate_condition(df: pd.DataFrame, cond: IndicatorCondition,
-                       indicator_data: dict[str, pd.Series]) -> pd.Series:
+# ============ 指标集 → 信号映射 ============
+
+def _signals_ma_rsi(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """MA+RSI: 趋势跟踪 + 动量过滤"""
+    fast, slow = parse_ma_range(w.ma_period_range)
+    ema_fast = ema(df, fast)
+    ema_slow = ema(df, slow)
+    rsi_val = rsi(df, w.rsi_period)
+
+    trend_up = ema_fast > ema_slow
+    trend_down = ema_fast < ema_slow
+    cross_up = trend_up & (ema(df, fast).shift(1) <= ema(df, slow).shift(1))
+    cross_down = trend_down & (ema(df, fast).shift(1) >= ema(df, slow).shift(1))
+
+    long_sig = cross_up & (rsi_val < 70)
+    short_sig = cross_down & (rsi_val > 30)
+    return long_sig, short_sig
+
+
+def _signals_macd_bb(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """MACD+BB: 动量 + 布林带回归"""
+    macd_line, signal_line, hist = macd(df)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(df)
+
+    macd_cross_up = (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
+    macd_cross_down = (macd_line < signal_line) & (macd_line.shift(1) >= signal_line.shift(1))
+
+    long_sig = macd_cross_up & (df["close"] < bb_mid)
+    short_sig = macd_cross_down & (df["close"] > bb_mid)
+    return long_sig, short_sig
+
+
+def _signals_supertrend_adx(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """Supertrend+ADX: 强趋势跟踪"""
+    fast, _ = parse_ma_range(w.ma_period_range)
+    st_line, st_dir = supertrend(df, period=max(fast, 7), multiplier=3.0)
+    adx_val, plus_di, minus_di = adx(df, w.adx_period)
+
+    strong_trend = adx_val > 25
+    dir_up = (st_dir == 1) & (st_dir.shift(1) == -1)
+    dir_down = (st_dir == -1) & (st_dir.shift(1) == 1)
+
+    long_sig = dir_up & strong_trend
+    short_sig = dir_down & strong_trend
+    return long_sig, short_sig
+
+
+def _signals_ichimoku_kdj(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """Ichimoku+KDJ(Stochastic): 云图趋势 + 随机指标"""
+    ichi = ichimoku(df)
+    stoch_k, stoch_d = stochastic(df, k_period=w.rsi_period, d_period=3)
+
+    cloud_top = pd.concat([ichi["senkou_a"], ichi["senkou_b"]], axis=1).max(axis=1)
+    cloud_bottom = pd.concat([ichi["senkou_a"], ichi["senkou_b"]], axis=1).min(axis=1)
+
+    above_cloud = df["close"] > cloud_top
+    below_cloud = df["close"] < cloud_bottom
+    tk_cross_up = (ichi["tenkan_sen"] > ichi["kijun_sen"]) & (ichi["tenkan_sen"].shift(1) <= ichi["kijun_sen"].shift(1))
+    tk_cross_down = (ichi["tenkan_sen"] < ichi["kijun_sen"]) & (ichi["tenkan_sen"].shift(1) >= ichi["kijun_sen"].shift(1))
+
+    long_sig = above_cloud & tk_cross_up & (stoch_k < 80)
+    short_sig = below_cloud & tk_cross_down & (stoch_k > 20)
+    return long_sig, short_sig
+
+
+def _signals_ema_volume(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """EMA+Volume: 趋势 + 成交量确认"""
+    fast, slow = parse_ma_range(w.ma_period_range)
+    ema_val = ema(df, fast)
+    vol_ratio = volume_spike(df, period=20)
+
+    price_above = df["close"] > ema_val
+    price_below = df["close"] < ema_val
+    cross_up = price_above & (~price_above.shift(1).fillna(False))
+    cross_down = price_below & (~price_below.shift(1).fillna(False))
+    vol_high = vol_ratio > 1.5
+
+    long_sig = cross_up & vol_high
+    short_sig = cross_down & vol_high
+    return long_sig, short_sig
+
+
+def _signals_stochastic_cci(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """Stochastic+CCI: 超买超卖 + 动量反转"""
+    stoch_k, stoch_d = stochastic(df, k_period=w.rsi_period)
+    cci_val = cci(df, period=w.adx_period)
+
+    long_sig = (stoch_k < 20) & (stoch_k > stoch_k.shift(1)) & (cci_val < -100)
+    short_sig = (stoch_k > 80) & (stoch_k < stoch_k.shift(1)) & (cci_val > 100)
+    return long_sig, short_sig
+
+
+def _signals_price_action(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """PurePriceAction: 支撑阻力 + 蜡烛形态"""
+    _, slow = parse_ma_range(w.ma_period_range)
+    resistance = df["high"].rolling(slow).max().shift(1)
+    support = df["low"].rolling(slow).min().shift(1)
+
+    body = df["close"] - df["open"]
+    body_abs = body.abs()
+    upper_shadow = df["high"] - df[["open", "close"]].max(axis=1)
+    lower_shadow = df[["open", "close"]].min(axis=1) - df["low"]
+
+    bullish_pin = (lower_shadow > 2 * body_abs) & (upper_shadow < body_abs * 0.3)
+    bearish_pin = (upper_shadow > 2 * body_abs) & (lower_shadow < body_abs * 0.3)
+
+    near_support = (df["low"] - support).abs() / df["close"] < 0.01
+    near_resistance = (df["high"] - resistance).abs() / df["close"] < 0.01
+
+    long_sig = near_support & (bullish_pin | (body > 0))
+    short_sig = near_resistance & (bearish_pin | (body < 0))
+    return long_sig, short_sig
+
+
+def _signals_multi3(df: pd.DataFrame, w: WeightVector) -> tuple[pd.Series, pd.Series]:
+    """Multi3: RSI + MACD + Bollinger 三指标组合"""
+    rsi_val = rsi(df, w.rsi_period)
+    macd_line, signal_line, hist = macd(df)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(df)
+
+    rsi_long = rsi_val < 40
+    rsi_short = rsi_val > 60
+    macd_long = hist > 0
+    macd_short = hist < 0
+    bb_long = df["close"] < bb_mid
+    bb_short = df["close"] > bb_mid
+
+    long_sig = rsi_long & macd_long & bb_long
+    short_sig = rsi_short & macd_short & bb_short
+    return long_sig, short_sig
+
+
+INDICATOR_SET_MAP = {
+    "MA+RSI": _signals_ma_rsi,
+    "MACD+BB": _signals_macd_bb,
+    "Supertrend+ADX": _signals_supertrend_adx,
+    "Ichimoku+KDJ": _signals_ichimoku_kdj,
+    "EMA+Volume": _signals_ema_volume,
+    "Stochastic+CCI": _signals_stochastic_cci,
+    "PurePriceAction": _signals_price_action,
+    "Multi3": _signals_multi3,
+}
+
+
+# ============ 入场条件逻辑 ============
+
+def _apply_entry_condition(
+    long_raw: pd.Series,
+    short_raw: pd.Series,
+    df: pd.DataFrame,
+    w: WeightVector,
+    regime: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    """根据 entry_condition 调整信号逻辑"""
+    cond = w.entry_condition
+
+    if cond == "Strict":
+        return long_raw, short_raw
+
+    elif cond == "Loose":
+        rsi_val = rsi(df, w.rsi_period)
+        extra_long = rsi_val < 30
+        extra_short = rsi_val > 70
+        return long_raw | extra_long, short_raw | extra_short
+
+    elif cond == "MomentumBreak":
+        fast, _ = parse_ma_range(w.ma_period_range)
+        breakout_high, breakout_low = price_breakout(df, period=fast)
+        return long_raw & breakout_high, short_raw & breakout_low
+
+    elif cond == "MeanReversion":
+        bb_upper, _, bb_lower = bollinger_bands(df)
+        long_rev = df["close"] < bb_lower
+        short_rev = df["close"] > bb_upper
+        return long_raw | long_rev, short_raw | short_rev
+
+    elif cond == "RegimeConfirmed":
+        bull_mask = regime == "BULL"
+        bear_mask = regime == "BEAR"
+        return long_raw & bull_mask, short_raw & bear_mask
+
+    return long_raw, short_raw
+
+
+# ============ 入场确认 ============
+
+def _apply_confirmation(
+    long_sig: pd.Series,
+    short_sig: pd.Series,
+    df: pd.DataFrame,
+    w: WeightVector,
+) -> tuple[pd.Series, pd.Series]:
+    """根据 entry_confirmation 过滤信号"""
+    conf = w.entry_confirmation
+
+    if conf == "SingleBar":
+        return long_sig, short_sig
+
+    elif conf == "MultiBar":
+        long_confirmed = long_sig & long_sig.shift(1).fillna(False)
+        short_confirmed = short_sig & short_sig.shift(1).fillna(False)
+        return long_confirmed, short_confirmed
+
+    elif conf == "VolumeSpike":
+        vol_ratio = volume_spike(df, period=20)
+        vol_high = vol_ratio > 1.5
+        return long_sig & vol_high, short_sig & vol_high
+
+    return long_sig, short_sig
+
+
+# ============ 主信号生成函数 ============
+
+def generate_signals(
+    df: pd.DataFrame,
+    weights: WeightVector,
+    regime: pd.Series,
+) -> pd.Series:
     """
-    评估单个指标条件，返回布尔Series。
-    """
-    ind_type = cond.indicator
-    op = cond.condition
-    params = cond.params
+    根据权重向量生成交易信号。
 
-    # 确保指标已计算
-    if not any(k in df.columns for k in indicator_data):
-        new_cols = compute_indicator(df, ind_type, params)
-        indicator_data.update(new_cols)
-        for k, v in new_cols.items():
-            df[k] = v
-
-    # 根据条件类型评估
-    if ind_type == "ema_cross" or ind_type == "sma_cross":
-        prefix = "ema" if "ema" in ind_type else "sma"
-        fast = params.get("fast", 12)
-        slow = params.get("slow", 26)
-        fast_col = f"{prefix}_{fast}"
-        slow_col = f"{prefix}_{slow}"
-
-        if op == "cross_above":
-            return (df[fast_col] > df[slow_col]) & (df[fast_col].shift(1) <= df[slow_col].shift(1))
-        elif op == "cross_below":
-            return (df[fast_col] < df[slow_col]) & (df[fast_col].shift(1) >= df[slow_col].shift(1))
-        elif op == "above":
-            return df[fast_col] > df[slow_col]
-        elif op == "below":
-            return df[fast_col] < df[slow_col]
-
-    elif ind_type == "rsi":
-        col = "rsi"
-        if op == "above":
-            return df[col] > cond.value
-        elif op == "below":
-            return df[col] < cond.value
-        elif op == "cross_above":
-            return (df[col] > cond.value) & (df[col].shift(1) <= cond.value)
-        elif op == "cross_below":
-            return (df[col] < cond.value) & (df[col].shift(1) >= cond.value)
-        elif op == "between":
-            return (df[col] >= cond.value) & (df[col] <= cond.value2)
-        elif op == "increasing":
-            return df[col] > df[col].shift(1)
-        elif op == "decreasing":
-            return df[col] < df[col].shift(1)
-
-    elif ind_type == "macd":
-        if op == "cross_above":
-            return (df["macd"] > df["macd_signal"]) & (df["macd"].shift(1) <= df["macd_signal"].shift(1))
-        elif op == "cross_below":
-            return (df["macd"] < df["macd_signal"]) & (df["macd"].shift(1) >= df["macd_signal"].shift(1))
-        elif op == "above":
-            return df["macd_hist"] > 0
-        elif op == "below":
-            return df["macd_hist"] < 0
-        elif op == "increasing":
-            return df["macd_hist"] > df["macd_hist"].shift(1)
-        elif op == "decreasing":
-            return df["macd_hist"] < df["macd_hist"].shift(1)
-
-    elif ind_type == "bollinger":
-        if op == "above":
-            return df["close"] > df["bb_upper"]
-        elif op == "below":
-            return df["close"] < df["bb_lower"]
-        elif op == "cross_above":
-            return (df["close"] > df["bb_upper"]) & (df["close"].shift(1) <= df["bb_upper"].shift(1))
-        elif op == "cross_below":
-            return (df["close"] < df["bb_lower"]) & (df["close"].shift(1) >= df["bb_lower"].shift(1))
-        elif op == "squeeze":
-            # 布林带宽度低于历史N期最低
-            percentile = df["bb_width"].rolling(50).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
-            return percentile < 0.2
-        elif op == "expansion":
-            percentile = df["bb_width"].rolling(50).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
-            return percentile > 0.8
-
-    elif ind_type == "adx":
-        if op == "above":
-            return df["adx"] > cond.value
-        elif op == "below":
-            return df["adx"] < cond.value
-        elif op == "increasing":
-            return df["adx"] > df["adx"].shift(1)
-
-    elif ind_type == "stochastic":
-        if op == "cross_above":
-            return (df["stoch_k"] > df["stoch_d"]) & (df["stoch_k"].shift(1) <= df["stoch_d"].shift(1))
-        elif op == "cross_below":
-            return (df["stoch_k"] < df["stoch_d"]) & (df["stoch_k"].shift(1) >= df["stoch_d"].shift(1))
-        elif op == "above":
-            return df["stoch_k"] > cond.value
-        elif op == "below":
-            return df["stoch_k"] < cond.value
-
-    elif ind_type == "supertrend":
-        if op == "above":
-            return df["supertrend_dir"] == 1
-        elif op == "below":
-            return df["supertrend_dir"] == -1
-        elif op == "cross_above":
-            return (df["supertrend_dir"] == 1) & (df["supertrend_dir"].shift(1) == -1)
-        elif op == "cross_below":
-            return (df["supertrend_dir"] == -1) & (df["supertrend_dir"].shift(1) == 1)
-
-    elif ind_type == "volume_spike":
-        threshold = cond.value or 2.0
-        if op == "above":
-            return df["vol_ratio"] > threshold
-        elif op == "below":
-            return df["vol_ratio"] < threshold
-
-    elif ind_type == "price_breakout":
-        if op == "above" or op == "cross_above":
-            return df["breakout_high"]
-        elif op == "below" or op == "cross_below":
-            return df["breakout_low"]
-
-    elif ind_type == "vwap":
-        if op == "above":
-            return df["close"] > df["vwap"]
-        elif op == "below":
-            return df["close"] < df["vwap"]
-        elif op == "cross_above":
-            return (df["close"] > df["vwap"]) & (df["close"].shift(1) <= df["vwap"].shift(1))
-        elif op == "cross_below":
-            return (df["close"] < df["vwap"]) & (df["close"].shift(1) >= df["vwap"].shift(1))
-
-    elif ind_type == "ichimoku":
-        if op == "cross_above":
-            # 转换线穿越基准线
-            return (df["tenkan_sen"] > df["kijun_sen"]) & (df["tenkan_sen"].shift(1) <= df["kijun_sen"].shift(1))
-        elif op == "cross_below":
-            return (df["tenkan_sen"] < df["kijun_sen"]) & (df["tenkan_sen"].shift(1) >= df["kijun_sen"].shift(1))
-        elif op == "above":
-            # 价格在云上方
-            cloud_top = pd.concat([df["senkou_a"], df["senkou_b"]], axis=1).max(axis=1)
-            return df["close"] > cloud_top
-        elif op == "below":
-            cloud_bottom = pd.concat([df["senkou_a"], df["senkou_b"]], axis=1).min(axis=1)
-            return df["close"] < cloud_bottom
-
-    elif ind_type == "ema" or ind_type == "sma":
-        prefix = ind_type
-        period = params.get("period", 20)
-        col = f"{prefix}_{period}"
-        if op == "above":
-            return df["close"] > df[col]
-        elif op == "below":
-            return df["close"] < df[col]
-        elif op == "cross_above":
-            return (df["close"] > df[col]) & (df["close"].shift(1) <= df[col].shift(1))
-        elif op == "cross_below":
-            return (df["close"] < df[col]) & (df["close"].shift(1) >= df[col].shift(1))
-
-    elif ind_type == "atr":
-        col = "atr"
-        atr_pct = df[col] / df["close"]
-        if op == "above":
-            return atr_pct > cond.value
-        elif op == "below":
-            return atr_pct < cond.value
-
-    elif ind_type == "keltner":
-        if op == "above":
-            return df["close"] > df["kc_upper"]
-        elif op == "below":
-            return df["close"] < df["kc_lower"]
-
-    elif ind_type == "support_resistance":
-        if op == "above":
-            return df["close"] > df["resistance"] * (1 - (cond.value or 0.01))
-        elif op == "below":
-            return df["close"] < df["support"] * (1 + (cond.value or 0.01))
-
-    elif ind_type == "candle_pattern":
-        pattern = params.get("pattern", "hammer")
-        if pattern in df.columns:
-            return df[pattern].astype(bool)
-
-    elif ind_type in ("cci", "williams_r", "mfi"):
-        col = ind_type
-        if op == "above":
-            return df[col] > cond.value
-        elif op == "below":
-            return df[col] < cond.value
-        elif op == "cross_above":
-            return (df[col] > cond.value) & (df[col].shift(1) <= cond.value)
-        elif op == "cross_below":
-            return (df[col] < cond.value) & (df[col].shift(1) >= cond.value)
-
-    # fallback
-    return pd.Series(False, index=df.index)
-
-
-def generate_entry_signals(df: pd.DataFrame, strategy: BotStrategy) -> pd.Series:
-    """
-    根据策略配置生成入场信号。
-    entry_rules之间是OR关系，每个rule内的conditions是AND关系。
-
-    返回: Series of int (1=做多信号, -1=做空信号, 0=无信号)
+    Returns:
+        Series of int: 1=做多, -1=做空, 0=无信号
     """
     df = df.copy()
-    indicator_data = {}
-    direction = strategy.position.direction
 
-    # 先计算所有需要的指标
-    all_conditions = []
-    for rule in strategy.entry_rules:
-        all_conditions.extend(rule.conditions)
-    for cond in strategy.exit_rule.signal_exit:
-        all_conditions.append(cond)
+    sig_func = INDICATOR_SET_MAP.get(weights.indicator_set, _signals_ma_rsi)
+    long_raw, short_raw = sig_func(df, weights)
 
-    for cond in all_conditions:
-        new_cols = compute_indicator(df, cond.indicator, cond.params)
-        indicator_data.update(new_cols)
-        for k, v in new_cols.items():
-            if k not in df.columns:
-                df[k] = v
+    long_raw = long_raw.fillna(False)
+    short_raw = short_raw.fillna(False)
 
-    # 评估入场信号
-    long_signal = pd.Series(False, index=df.index)
-    short_signal = pd.Series(False, index=df.index)
+    long_sig, short_sig = _apply_entry_condition(long_raw, short_raw, df, weights, regime)
 
-    for rule in strategy.entry_rules:
-        if not rule.conditions:
-            continue
+    long_sig, short_sig = _apply_confirmation(long_sig, short_sig, df, weights)
 
-        # 每个rule内的conditions是AND
-        rule_signal = pd.Series(True, index=df.index)
-        for cond in rule.conditions:
-            cond_result = evaluate_condition(df, cond, indicator_data)
-            rule_signal = rule_signal & cond_result
+    # regime过滤
+    for i in range(len(df)):
+        r = regime.iloc[i]
+        if not weights.should_trade_regime(r):
+            rng = np.random.default_rng(seed=i)
+            if rng.random() > weights.regime_override_prob:
+                long_sig.iloc[i] = False
+                short_sig.iloc[i] = False
 
-        # 根据条件的语义判断方向
-        # 简化：偶数rule做多，奇数rule做空（实际由条件语义决定）
-        # 更好的方式：rule中的conditions含"上涨"语义→做多
-        long_signal = long_signal | rule_signal
+    # 反向逻辑
+    if weights.reverse_logic_prob > 0:
+        rng = np.random.default_rng(seed=42)
+        reverse_mask = rng.random(len(df)) < weights.reverse_logic_prob
+        for i in range(len(df)):
+            if reverse_mask[i]:
+                long_sig.iloc[i], short_sig.iloc[i] = short_sig.iloc[i], long_sig.iloc[i]
 
-    # 生成方向信号
-    signals = pd.Series(0, index=df.index)
-    if direction in ("long_only", "both"):
-        signals = signals.where(~long_signal, 1)
-    if direction in ("short_only", "both"):
-        # 对于做空，使用相同的信号但反向
-        # 实际中应该有独立的做空规则，但在简化版本中反转信号
-        if direction == "short_only":
-            signals = signals.where(~long_signal, -1)
+    # bias_towards_action: 低值 = 更少信号，高值 = 更多信号
+    if weights.bias_towards_action < 0.5:
+        suppress_rate = 0.5 - weights.bias_towards_action
+        rng = np.random.default_rng(seed=123)
+        suppress_mask = rng.random(len(df)) < suppress_rate
+        long_sig = long_sig & ~pd.Series(suppress_mask, index=df.index)
+        short_sig = short_sig & ~pd.Series(suppress_mask, index=df.index)
 
-    return signals, df
+    signals = pd.Series(0, index=df.index, dtype=int)
+    signals[long_sig] = 1
+    signals[short_sig] = -1
+    # 多空同时触发时，BULL优先做多，BEAR优先做空
+    conflict = long_sig & short_sig
+    if conflict.any():
+        for i in conflict[conflict].index:
+            signals.iloc[i] = 1 if regime.iloc[i] == "BULL" else -1
 
-
-def generate_exit_signals(df: pd.DataFrame, strategy: BotStrategy,
-                          indicator_data: dict) -> pd.Series:
-    """
-    生成信号退出条件（不含止盈止损，那些在回测引擎中处理）。
-    """
-    exit_signal = pd.Series(False, index=df.index)
-
-    for cond in strategy.exit_rule.signal_exit:
-        cond_result = evaluate_condition(df, cond, indicator_data)
-        exit_signal = exit_signal | cond_result
-
-    return exit_signal
+    return signals
