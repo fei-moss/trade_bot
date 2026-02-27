@@ -190,10 +190,13 @@ def run_backtest(
             exit_price = None
             exit_reason = ""
 
-            # 爆仓检查
-            unreal_pct = _unrealized_pnl_pct(open_pos, price)
+            # 爆仓检查（用high/low判断，做多看low，做空看high）
+            liq_price = low if open_pos.direction == 1 else high
+            unreal_pct = _unrealized_pnl_pct(open_pos, liq_price)
             if unreal_pct <= -1.0:
-                exit_price = price
+                liq_threshold = open_pos.entry_price * (1 - 1.0 / open_pos.leverage) if open_pos.direction == 1 \
+                    else open_pos.entry_price * (1 + 1.0 / open_pos.leverage)
+                exit_price = liq_threshold
                 exit_reason = "liquidation"
 
             # 止损

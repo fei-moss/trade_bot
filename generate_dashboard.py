@@ -109,12 +109,18 @@ def _downsample(arr, max_points=500):
 
 def build_html(bots_data, price_data, regime_data, output_path):
     """生成自包含HTML展示页面。"""
+    import math
     colors = ['#58a6ff','#56d364','#bc8cff','#f0883e','#f85149','#3fb950','#d2a8ff','#79c0ff','#ffa657']
     for i, b in enumerate(bots_data):
         eq, idx = _downsample(b["equity"])
         ts = [b["equity_timestamps"][j] if j < len(b["equity_timestamps"]) else "" for j in idx]
         dd = [b["drawdown"][j] if j < len(b["drawdown"]) else 0 for j in idx]
+        initial = b["equity"][0] if b["equity"] else 10000
+        eq_log = [round(math.log10(max(v, 1)), 4) for v in eq]
+        ret_pct = [round((v / initial - 1) * 100, 2) for v in eq]
         b["equity_ds"] = eq
+        b["equity_log"] = eq_log
+        b["return_pct"] = ret_pct
         b["timestamps_ds"] = ts
         b["drawdown_ds"] = dd
         b["color"] = colors[i % len(colors)]
@@ -230,7 +236,7 @@ const BOTS = {data_json};
 const PRICE = {price_json};
 const REGIME = {regime_json};
 
-let currentChart1 = null, currentChart2 = null, currentChart3 = null;
+let currentChart1 = null, currentChart2 = null, currentChart3 = null, currentChart4 = null;
 
 function fmtVal(v) {{
   if (v >= 1e9) return (v/1e9).toFixed(1)+'B';
@@ -267,18 +273,31 @@ function renderOverview() {{
   `;
 }}
 
+function logTickLabel(logVal) {{
+  const v = Math.pow(10, logVal);
+  if (v >= 1e9) return '$' + (v/1e9).toFixed(0) + 'B';
+  if (v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
+  if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
+  return '$' + v.toFixed(0);
+}}
+
 function renderCompareChart() {{
-  const maxLen = Math.max(...BOTS.map(b => b.equity_ds.length));
   const labels = BOTS[0].timestamps_ds;
   const datasets = BOTS.map(b => ({{
     label: b.bot_id,
-    data: b.equity_ds,
+    data: b.equity_log,
     borderColor: b.color,
     backgroundColor: 'transparent',
     pointRadius: 0,
     borderWidth: 1.5,
     tension: 0.1,
   }}));
+  const allLog = BOTS.flatMap(b => b.equity_log);
+  const minLog = Math.floor(Math.min(...allLog));
+  const maxLog = Math.ceil(Math.max(...allLog));
+  const ticks = [];
+  for (let i = minLog; i <= maxLog; i++) ticks.push(i);
+
   new Chart(document.getElementById('compareChart'), {{
     type: 'line',
     data: {{ labels, datasets }},
@@ -287,11 +306,18 @@ function renderCompareChart() {{
       interaction: {{ mode: 'index', intersect: false }},
       plugins: {{
         legend: {{ position: 'bottom', labels: {{ color: '#8b949e', usePointStyle: true, pointStyle: 'line', padding: 16, font: {{ size: 11 }} }} }},
-        tooltip: {{ callbacks: {{ label: ctx => ctx.dataset.label + ': $' + fmtVal(ctx.parsed.y) }} }}
+        tooltip: {{ callbacks: {{ label: ctx => ctx.dataset.label + ': $' + fmtVal(Math.pow(10, ctx.parsed.y)) }} }}
       }},
       scales: {{
         x: {{ ticks: {{ color: '#484f58', maxTicksLimit: 12, maxRotation: 0 }}, grid: {{ color: '#21262d' }} }},
-        y: {{ type: 'logarithmic', ticks: {{ color: '#484f58', callback: v => '$'+fmtVal(v) }}, grid: {{ color: '#21262d' }}, min: 100 }}
+        y: {{
+          type: 'linear',
+          min: minLog,
+          max: maxLog,
+          afterBuildTicks: axis => {{ axis.ticks = ticks.map(v => ({{ value: v }})); }},
+          ticks: {{ color: '#484f58', callback: (v) => logTickLabel(v) }},
+          grid: {{ color: '#21262d' }}
+        }}
       }}
     }}
   }});
@@ -367,6 +393,7 @@ function selectBot(idx) {{
   if (b.trades.length > 0) {{
     tradesHtml = b.trades.map((t, i) => {{
       const pCls = t.pnl_pct > 0 ? 'positive' : 'negative';
+      const posSize = '$' + fmtVal(t.margin * t.leverage);
       return `<tr>
         <td>${{i+1}}</td>
         <td>${{t.entry_time}}</td>
@@ -375,6 +402,9 @@ function selectBot(idx) {{
         <td>${{t.leverage}}x</td>
         <td>${{t.entry_price.toLocaleString()}}</td>
         <td>${{t.exit_price.toLocaleString()}}</td>
+        <td style="text-align:right">${{fmtVal(t.margin)}}</td>
+        <td style="text-align:right">${{posSize}}</td>
+        <td class="${{pCls}}" style="font-weight:600;text-align:right">${{t.pnl >= 0 ? '+$' : '-$'}}${{fmtVal(Math.abs(t.pnl))}}</td>
         <td class="${{pCls}}" style="font-weight:600">${{t.pnl_pct > 0 ? '+' : ''}}${{t.pnl_pct.toFixed(2)}}%</td>
         <td><span class="tag" style="background:#21262d;color:#8b949e">${{t.exit_reason}}</span></td>
       </tr>`;
@@ -396,17 +426,19 @@ function selectBot(idx) {{
       <div class="metric"><div class="mv">${{m.max_consecutive_wins}} / ${{m.max_consecutive_losses}}</div><div class="ml">连胜/连亏</div></div>
     </div>
     ${{Object.keys(m.regime_performance || {{}}).length > 0 ? '<div class="section-title">Regime 表现</div><div class="metrics-grid">' + regimeHtml + '</div>' : ''}}
-    <div class="section-title">权益曲线 & 回撤</div>
+    <div class="section-title">权益曲线 & 收益率</div>
     <div class="chart-row">
-      <div class="chart-box"><h3>权益曲线</h3><canvas id="equityChart"></canvas></div>
-      <div class="chart-box"><h3>回撤曲线</h3><canvas id="ddChart"></canvas></div>
+      <div class="chart-box"><h3>权益曲线 (等比例对数坐标)</h3><canvas id="equityChart"></canvas></div>
+      <div class="chart-box"><h3>累计收益率 %</h3><canvas id="returnChart"></canvas></div>
     </div>
+    <div class="section-title">回撤曲线</div>
+    <div class="chart-box" style="margin-bottom:16px"><canvas id="ddChart"></canvas></div>
     ${{b.trades.length > 0 ? `
       <div class="section-title">盈亏分布 (${{b.trades.length}} 笔)</div>
       <div class="chart-box" style="margin-bottom:16px"><canvas id="pnlChart" height="90"></canvas></div>
       <div class="section-title">交易明细</div>
       <div class="trades-wrap"><table>
-        <thead><tr><th>#</th><th>开仓</th><th>平仓</th><th>方向</th><th>杠杆</th><th>开仓价</th><th>平仓价</th><th>盈亏</th><th>原因</th></tr></thead>
+        <thead><tr><th>#</th><th>开仓</th><th>平仓</th><th>方向</th><th>杠杆</th><th>开仓价</th><th>平仓价</th><th>保证金</th><th>仓位</th><th>盈亏额</th><th>盈亏%</th><th>原因</th></tr></thead>
         <tbody>${{tradesHtml}}</tbody>
       </table></div>
     ` : '<div class="empty-msg">该Bot在回测期间无交易</div>'}}
@@ -422,55 +454,89 @@ function renderCharts(b) {{
   if (currentChart1) currentChart1.destroy();
   if (currentChart2) currentChart2.destroy();
   if (currentChart3) currentChart3.destroy();
+  if (currentChart4) currentChart4.destroy();
 
   const labels = b.timestamps_ds;
-  const chartOpts = {{
-    responsive: true,
-    plugins: {{ legend: {{ display: false }} }},
-    scales: {{
-      x: {{ ticks: {{ color: '#484f58', maxTicksLimit: 8, maxRotation: 0, font: {{ size: 10 }} }}, grid: {{ color: '#21262d' }} }},
-    }}
-  }};
+  const xScale = {{ ticks: {{ color: '#484f58', maxTicksLimit: 8, maxRotation: 0, font: {{ size: 10 }} }}, grid: {{ color: '#21262d' }} }};
 
-  const useLog = Math.max(...b.equity_ds) / Math.min(...b.equity_ds.filter(v => v > 0)) > 100;
+  // 权益曲线：log10 + 线性坐标 = 等比例
+  const logData = b.equity_log;
+  const minL = Math.floor(Math.min(...logData));
+  const maxL = Math.ceil(Math.max(...logData));
+  const yTicks = [];
+  for (let i = minL; i <= maxL; i++) yTicks.push(i);
 
   currentChart1 = new Chart(document.getElementById('equityChart'), {{
     type: 'line',
     data: {{
       labels,
-      datasets: [{{ data: b.equity_ds, borderColor: b.color, backgroundColor: b.color + '18', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.1 }}]
+      datasets: [{{ data: logData, borderColor: b.color, backgroundColor: b.color + '18', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.1 }}]
     }},
     options: {{
-      ...chartOpts,
-      plugins: {{ ...chartOpts.plugins, tooltip: {{ callbacks: {{ label: ctx => '$' + fmtVal(ctx.parsed.y) }} }} }},
+      responsive: true,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{ callbacks: {{ label: ctx => '$' + fmtVal(Math.pow(10, ctx.parsed.y)) }} }}
+      }},
       scales: {{
-        ...chartOpts.scales,
-        y: useLog
-          ? {{ type: 'logarithmic', ticks: {{ color: '#484f58', callback: v => '$'+fmtVal(v), font: {{ size: 10 }} }}, grid: {{ color: '#21262d' }} }}
-          : {{ ticks: {{ color: '#484f58', callback: v => '$'+fmtVal(v), font: {{ size: 10 }} }}, grid: {{ color: '#21262d' }} }}
+        x: xScale,
+        y: {{
+          type: 'linear',
+          min: minL,
+          max: maxL,
+          afterBuildTicks: axis => {{ axis.ticks = yTicks.map(v => ({{ value: v }})); }},
+          ticks: {{ color: '#484f58', callback: v => logTickLabel(v), font: {{ size: 10 }} }},
+          grid: {{ color: '#21262d' }}
+        }}
       }}
     }}
   }});
 
-  currentChart2 = new Chart(document.getElementById('ddChart'), {{
+  // 累计收益率 % 曲线
+  currentChart2 = new Chart(document.getElementById('returnChart'), {{
+    type: 'line',
+    data: {{
+      labels,
+      datasets: [{{ data: b.return_pct, borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.1 }}]
+    }},
+    options: {{
+      responsive: true,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{ callbacks: {{ label: ctx => ctx.parsed.y.toFixed(1) + '%' }} }}
+      }},
+      scales: {{
+        x: xScale,
+        y: {{ ticks: {{ color: '#484f58', callback: v => fmtRet(v), font: {{ size: 10 }} }}, grid: {{ color: '#21262d' }} }}
+      }}
+    }}
+  }});
+
+  // 回撤曲线
+  currentChart3 = new Chart(document.getElementById('ddChart'), {{
     type: 'line',
     data: {{
       labels,
       datasets: [{{ data: b.drawdown_ds, borderColor: '#f85149', backgroundColor: 'rgba(248,81,73,0.1)', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.1 }}]
     }},
     options: {{
-      ...chartOpts,
+      responsive: true,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{ callbacks: {{ label: ctx => ctx.parsed.y.toFixed(1) + '%' }} }}
+      }},
       scales: {{
-        ...chartOpts.scales,
+        x: xScale,
         y: {{ ticks: {{ color: '#484f58', callback: v => v.toFixed(0) + '%', font: {{ size: 10 }} }}, grid: {{ color: '#21262d' }} }}
       }}
     }}
   }});
 
+  // 单笔盈亏柱状图
   if (b.trades.length > 0) {{
     const pnls = b.trades.map(t => t.pnl_pct);
     const pnlColors = pnls.map(p => p > 0 ? '#56d364' : '#f85149');
-    currentChart3 = new Chart(document.getElementById('pnlChart'), {{
+    currentChart4 = new Chart(document.getElementById('pnlChart'), {{
       type: 'bar',
       data: {{
         labels: pnls.map((_, i) => '#' + (i+1)),
