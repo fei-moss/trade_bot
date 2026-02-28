@@ -35,6 +35,7 @@ def fetch_ohlcv(
     days: int = 120,
     exchange_id: str = "binance",
     use_cache: bool = True,
+    since_date: str = None,
 ) -> pd.DataFrame:
     """
     下载OHLCV数据。
@@ -45,38 +46,55 @@ def fetch_ohlcv(
         days: 下载天数（默认120天≈4个月）
         exchange_id: 交易所
         use_cache: 是否使用本地缓存
+        since_date: 起始日期（如 "2024-01-01"），设置后忽略days参数从today倒推
 
     Returns:
         DataFrame with columns: timestamp, open, high, low, close, volume
     """
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    if since_date:
+        cache_tag = f"{since_date}_{days}d"
+    else:
+        cache_tag = f"{days}d"
+
     cache_file = os.path.join(
         DATA_DIR,
-        f"{exchange_id}_{symbol.replace('/', '_')}_{timeframe}_{days}d.csv"
+        f"{exchange_id}_{symbol.replace('/', '_')}_{timeframe}_{cache_tag}.csv"
     )
 
-    # 检查精确匹配的缓存
     if use_cache and os.path.exists(cache_file):
         mod_time = os.path.getmtime(cache_file)
         if time.time() - mod_time < 86400:
+            print(f"Using cached file: {os.path.basename(cache_file)}")
             return pd.read_csv(cache_file, parse_dates=["timestamp"])
 
-    # 模糊匹配：查找同交易对/周期但不同天数的缓存
-    if use_cache:
-        import glob
-        prefix = f"{exchange_id}_{symbol.replace('/', '_')}_{timeframe}_"
-        pattern = os.path.join(DATA_DIR, f"{prefix}*d.csv")
-        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-        if matches:
-            best = matches[0]
-            print(f"Using cached file: {os.path.basename(best)}")
-            return pd.read_csv(best, parse_dates=["timestamp"])
+    if not since_date:
+        if use_cache:
+            import glob
+            prefix = f"{exchange_id}_{symbol.replace('/', '_')}_{timeframe}_"
+            pattern = os.path.join(DATA_DIR, f"{prefix}{days}d.csv")
+            matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+            if matches:
+                best = matches[0]
+                print(f"Using cached file: {os.path.basename(best)}")
+                return pd.read_csv(best, parse_dates=["timestamp"])
 
     exchange = get_exchange(exchange_id)
-    since = exchange.parse8601((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+
+    if since_date:
+        start_dt = datetime.fromisoformat(since_date).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=days)
+        since = exchange.parse8601(start_dt.isoformat())
+        end_ms = exchange.parse8601(end_dt.isoformat())
+    else:
+        since = exchange.parse8601((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
+        end_ms = None
 
     all_data = []
     limit = 1000
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    target_end = end_ms if end_ms else now_ms
 
     while True:
         try:
@@ -88,12 +106,21 @@ def fetch_ohlcv(
         if not ohlcv:
             break
 
-        all_data.extend(ohlcv)
-        since = ohlcv[-1][0] + 1  # 下一根K线起始
+        if end_ms:
+            ohlcv = [c for c in ohlcv if c[0] < end_ms]
 
-        if len(ohlcv) < limit:
+        all_data.extend(ohlcv)
+
+        if not ohlcv:
             break
 
+        last_ts = ohlcv[-1][0]
+        if last_ts >= target_end - 1:
+            break
+        if last_ts <= since:
+            break
+
+        since = last_ts + 1
         time.sleep(exchange.rateLimit / 1000)
 
     if not all_data:

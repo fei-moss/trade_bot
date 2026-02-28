@@ -54,6 +54,8 @@ class BacktestResult:
     max_consecutive_wins: int = 0
     max_consecutive_losses: int = 0
     regime_performance: dict = field(default_factory=dict)
+    blowup_count: int = 0
+    total_deposited: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +70,8 @@ class BacktestResult:
             "avg_loss": round(self.avg_loss, 4),
             "max_consecutive_wins": self.max_consecutive_wins,
             "max_consecutive_losses": self.max_consecutive_losses,
+            "blowup_count": self.blowup_count,
+            "total_deposited": round(self.total_deposited, 2),
             "regime_performance": {
                 k: {kk: round(vv, 4) for kk, vv in v.items()}
                 for k, v in self.regime_performance.items()
@@ -438,3 +442,47 @@ def batch_backtest(
         except Exception as e:
             print(f"[{i + 1}/{len(bots)}] {bot.bot_id}: FAILED - {e}")
     return results
+
+
+def multi_period_backtest(
+    bots: list[BotConfig],
+    eval_datasets: dict,
+    current_df: pd.DataFrame = None,
+    current_regime: pd.Series = None,
+    initial_capital: float = 10000.0,
+    cache: dict = None,
+) -> dict[str, dict[str, dict]]:
+    """
+    在多段历史行情上批量回测Bot。
+
+    Returns:
+        {bot_id: {period_name: result_dict, ...}, ...}
+    """
+    if cache is None:
+        cache = {}
+
+    all_results = {}
+    periods = dict(eval_datasets)
+    if current_df is not None and current_regime is not None:
+        periods["current"] = {"df": current_df, "regime": current_regime, "label": "当前"}
+
+    for bot in bots:
+        fp = bot.weights.fingerprint()
+        bot_results = {}
+        for pname, pdata in periods.items():
+            cache_key = (fp, pname)
+            if pname != "current" and cache_key in cache:
+                bot_results[pname] = cache[cache_key]
+                continue
+            try:
+                r = run_backtest(pdata["df"], bot, pdata["regime"], initial_capital)
+                rd = r.to_dict()
+                bot_results[pname] = rd
+                if pname != "current":
+                    cache[cache_key] = rd
+            except Exception:
+                bot_results[pname] = {"total_return": 0, "sharpe_ratio": 0, "total_trades": 0}
+
+        all_results[bot.bot_id] = bot_results
+
+    return all_results
