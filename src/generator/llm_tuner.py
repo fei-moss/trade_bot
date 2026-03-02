@@ -232,8 +232,26 @@ class LLMTuner:
 3. **分析哪些交易亏了、为什么** — 止损太紧被扫？方向判错？入场阈值太低信号太多？
 4. **找出参数的具体问题** — 不要泛泛而谈，要指出"sl_atr_mult=1.5太紧，应该加宽到2.0"
 5. **微调而非重设** — 你是在优化，不是重新设计。单个参数调整幅度不超过 15%
-6. **绝不背叛核心性格** — 用户说"激进做多"就不能变保守做空；说"高杠杆"就不能降到2x。短期亏损不是改变方向的理由
-7. **保持惯性** — 如果上一轮调参后效果还没充分体现，本轮应保持不变或仅微调
+6. **保持惯性** — 如果上一轮调参后效果还没充分体现，本轮应保持不变或仅微调
+
+## ⚠ 禁止修改的参数（性格参数，已锁定）
+
+以下参数定义了Bot的核心性格，你**不要输出**这些参数，即使你认为需要调整：
+- long_bias（方向偏好）
+- base_leverage / max_leverage（杠杆倍数）
+- risk_per_trade / max_position_pct（仓位大小）
+- rolling_*（滚仓配置）
+- trend_weight / momentum_weight / mean_revert_weight / volume_weight / volatility_weight（信号权重）
+
+## 允许调整的参数（战术参数）
+
+只输出你要修改的战术参数：
+- entry_threshold / exit_threshold（入场/出场阈值）
+- sl_atr_mult（止损距离）
+- tp_rr_ratio（止盈比）
+- trailing_enabled / trailing_activation_pct / trailing_distance_atr（移动止损）
+- regime_sensitivity / exit_on_regime_change（行情敏感度）
+- fast_ma_period / slow_ma_period / rsi_period 等技术参数
 
 输出调整后的参数和反思理由。"""
 

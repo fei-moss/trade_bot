@@ -1,13 +1,19 @@
 """
-精选20 Bot 进化测试
+精选20 Bot 进化测试 (v2 · 并发 · 新版反思)
 
 从历史3批 110 个 bot 中多维择优 20 个极端代表，
 用 15m K线 + 每周反思进化重跑，对比有/无反思效果。
 
+v2 改进:
+- 并发执行 (ThreadPoolExecutor)，多个 bot 同时跑反思
+- 增量保存：每完成一个 bot 立即写入磁盘
+- 新版反思逻辑：累计上下文 + 性格漂移检测 + 惯性约束
+
 维度: 赚得多 / 亏得多 / 历史峰值高 / 回撤最小 / Sharpe补齐
 """
 
-import os, sys, json, time
+import os, sys, json, time, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 
@@ -25,6 +31,18 @@ DAYS = 148
 EXCHANGE = "okx"
 REFLECTION_BARS = 672       # 7 days × 24h × 4
 INITIAL_CAPITAL = 10000.0
+MAX_WORKERS = 4             # 并发数（受 OpenRouter 速率限制）
+LEVERAGE_CAP = 150.0        # 杠杆上限
+
+
+def clamp_leverage(params: DecisionParams) -> DecisionParams:
+    """限制杠杆倍数在 1~LEVERAGE_CAP 范围内。"""
+    params.base_leverage = max(1.0, min(params.base_leverage, LEVERAGE_CAP))
+    params.max_leverage = max(1.0, min(params.max_leverage, LEVERAGE_CAP))
+    return params
+
+OUT_DIR = os.path.join(ROOT, "agent_top20_evolve")
+LOCK = threading.Lock()
 
 
 def load_all_bots():
@@ -77,7 +95,8 @@ def load_all_bots():
 
 
 def select_top20(all_bots):
-    """多维度择优：赚得多/亏得多/峰值高/回撤小/Sharpe补齐。"""
+    """多维度择优：赚得多/亏得多/峰值高/高频活跃/Sharpe补齐。"""
+    active = [b for b in all_bots if b["result"]["total_trades"] >= 10]
     for i, b in enumerate(all_bots):
         b["_key"] = f"{b['name']}_{b['batch']}_{i}"
 
@@ -92,23 +111,95 @@ def select_top20(all_bots):
                 selected.append(b)
                 added += 1
 
-    add_from(sorted(all_bots, key=lambda x: x["result"]["total_return"], reverse=True), 5)
-    add_from(sorted(all_bots, key=lambda x: x["result"]["total_return"]), 5)
-    add_from(sorted(all_bots, key=lambda x: x["peak"], reverse=True), 5)
-    add_from(sorted(all_bots, key=lambda x: (
-        x["result"]["max_drawdown"] if x["result"]["max_drawdown"] > 0 else 999
-    )), 5)
+    # 1. 赚得最多 (5)
+    add_from(sorted(active, key=lambda x: x["result"]["total_return"], reverse=True), 5)
+    # 2. 亏得最多 (5)
+    add_from(sorted(active, key=lambda x: x["result"]["total_return"]), 5)
+    # 3. 历史峰值最高 (5)
+    add_from(sorted(active, key=lambda x: x["peak"], reverse=True), 5)
+    # 4. 最活跃 — 交易笔数最多 (5)
+    add_from(sorted(active, key=lambda x: x["result"]["total_trades"], reverse=True), 5)
 
+    # 5. Sharpe 补齐（要求有足够交易）
     if len(selected) < 20:
-        add_from(sorted(all_bots, key=lambda x: x["result"]["sharpe_ratio"], reverse=True),
+        add_from(sorted(active, key=lambda x: x["result"]["sharpe_ratio"], reverse=True),
                  20 - len(selected))
 
     return selected
 
 
+def process_single_bot(idx, bot, df, regime, total):
+    """处理单个 bot：base回测 + 反思进化回测。线程安全。"""
+    tag = f"[{idx+1}/{total}]"
+    name = bot["name"]
+    params = DecisionParams.from_dict(bot["params"])
+    clamp_leverage(params)
+    prompt = bot["prompt"]
+
+    bt_base = run_agent_backtest(df, params, regime, initial_capital=INITIAL_CAPITAL)
+
+    tuner = LLMTuner()
+    bt_evo, evo_log = run_with_reflection(
+        df, params, regime, tuner,
+        user_prompt=prompt,
+        reflection_interval=REFLECTION_BARS,
+        initial_capital=INITIAL_CAPITAL,
+        verbose=True,
+    )
+
+    base_ret = bt_base.total_return
+    evo_ret = bt_evo.total_return
+    delta = evo_ret - base_ret
+
+    print(f"  {tag} {name:10s} | "
+          f"无反思: {base_ret*100:+8.1f}% (💥{bt_base.blowup_count}) | "
+          f"有反思: {evo_ret*100:+8.1f}% (💥{bt_evo.blowup_count}) | "
+          f"进化{len(evo_log)}轮 | Δ{delta*100:+.1f}%")
+    sys.stdout.flush()
+
+    result_data = {
+        "id": f"top_{idx+1:02d}",
+        "name": name,
+        "personality": bot["personality"],
+        "prompt": prompt,
+        "original_batch": bot["batch"],
+        "params": params.to_dict(),
+        "result_base": bt_base.to_dict(),
+        "result_evo": bt_evo.to_dict(),
+        "equity_base": bt_base.equity_curve.tolist(),
+        "equity": bt_evo.equity_curve.tolist(),
+        "evolution_log": evo_log,
+        "trades": [
+            {
+                "entry_idx": t.entry_idx,
+                "exit_idx": t.exit_idx,
+                "direction": "LONG" if t.direction == 1 else "SHORT",
+                "entry_price": round(t.entry_price, 2),
+                "exit_price": round(t.exit_price, 2) if t.exit_price else None,
+                "pnl_pct": round(t.pnl_pct * 100, 2),
+                "leverage": t.leverage,
+                "margin": round(t.margin, 2),
+                "exit_reason": t.exit_reason,
+            }
+            for t in bt_evo.trades
+        ],
+    }
+
+    save_incremental(result_data)
+    return result_data
+
+
+def save_incremental(result_data):
+    """线程安全地增量保存单个 bot 结果。"""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    bot_file = os.path.join(OUT_DIR, f"{result_data['id']}_{result_data['name']}.json")
+    with open(bot_file, "w") as f:
+        json.dump(result_data, f, indent=2, ensure_ascii=False)
+
+
 def main():
     print("=" * 60)
-    print("  精选20 Bot · 进化测试 (15m · 每周反思)")
+    print("  精选20 Bot · 进化测试 v2 (并发 · 新版反思)")
     print("=" * 60)
 
     # ─── 1. 选 Bot ───
@@ -136,76 +227,50 @@ def main():
         print(f"  {r}: {s['pct']:.0%}")
     sys.stdout.flush()
 
-    # ─── 3. 回测 (有反思 vs 无反思) ───
-    tuner = LLMTuner()
+    # ─── 3. 并发回测 ───
     n_segs = max(1, len(df) // REFLECTION_BARS)
-    print(f"\n[3] 回测 {len(top20)} 个 Bot | {n_segs} 周段 | "
-          f"预计 {len(top20) * n_segs} 次反思调用")
+    total_calls = len(top20) * n_segs
+    print(f"\n[3] 并发回测 {len(top20)} 个 Bot | {MAX_WORKERS} 并发 | "
+          f"{n_segs} 周段 | 预计 {total_calls} 次反思调用")
+    print(f"  增量保存到: {OUT_DIR}/")
     sys.stdout.flush()
 
-    final = []
-    for i, bot in enumerate(top20):
-        tag = f"[{i+1}/{len(top20)}]"
-        params = DecisionParams.from_dict(bot["params"])
-        prompt = bot["prompt"]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    t0 = time.time()
+    final = [None] * len(top20)
 
-        bt_base = run_agent_backtest(df, params, regime, initial_capital=INITIAL_CAPITAL)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(process_single_bot, i, bot, df, regime, len(top20)): i
+            for i, bot in enumerate(top20)
+        }
 
-        bt_evo, evo_log = run_with_reflection(
-            df, params, regime, tuner,
-            user_prompt=prompt,
-            reflection_interval=REFLECTION_BARS,
-            initial_capital=INITIAL_CAPITAL,
-            verbose=True,
-        )
+        completed = 0
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                result_data = future.result()
+                final[idx] = result_data
+                completed += 1
+                elapsed = time.time() - t0
+                avg_per_bot = elapsed / completed
+                remaining = (len(top20) - completed) * avg_per_bot / MAX_WORKERS
+                print(f"  ✓ 完成 {completed}/{len(top20)} | "
+                      f"已用 {elapsed/60:.0f}m | 预计剩余 {remaining/60:.0f}m")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"  ✗ Bot #{idx+1} 失败: {e}")
+                sys.stdout.flush()
 
-        base_ret = bt_base.total_return
-        evo_ret = bt_evo.total_return
-        delta = evo_ret - base_ret
+    final = [r for r in final if r is not None]
 
-        print(f"  {tag} {bot['name']:10s} | "
-              f"无反思: {base_ret*100:+8.1f}% (💥{bt_base.blowup_count}) | "
-              f"有反思: {evo_ret*100:+8.1f}% (💥{bt_evo.blowup_count}) | "
-              f"进化{len(evo_log)}轮 | Δ{delta*100:+.1f}%")
-        sys.stdout.flush()
-
-        final.append({
-            "id": f"top_{i+1:02d}",
-            "name": bot["name"],
-            "personality": bot["personality"],
-            "prompt": prompt,
-            "original_batch": bot["batch"],
-            "params": params.to_dict(),
-            "result_base": bt_base.to_dict(),
-            "result_evo": bt_evo.to_dict(),
-            "equity_base": bt_base.equity_curve.tolist(),
-            "equity": bt_evo.equity_curve.tolist(),
-            "evolution_log": evo_log,
-            "trades": [
-                {
-                    "entry_idx": t.entry_idx,
-                    "exit_idx": t.exit_idx,
-                    "direction": "LONG" if t.direction == 1 else "SHORT",
-                    "entry_price": round(t.entry_price, 2),
-                    "exit_price": round(t.exit_price, 2) if t.exit_price else None,
-                    "pnl_pct": round(t.pnl_pct * 100, 2),
-                    "leverage": t.leverage,
-                    "margin": round(t.margin, 2),
-                    "exit_reason": t.exit_reason,
-                }
-                for t in bt_evo.trades
-            ],
-        })
-
-    # ─── 4. 保存 ───
-    out_dir = os.path.join(ROOT, "agent_top20_evolve")
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "all_bots.json"), "w") as f:
+    # ─── 4. 合并保存 ───
+    with open(os.path.join(OUT_DIR, "all_bots.json"), "w") as f:
         json.dump(final, f, indent=2, ensure_ascii=False)
     btc_prices = df["close"].tolist()
-    with open(os.path.join(out_dir, "btc_prices.json"), "w") as f:
+    with open(os.path.join(OUT_DIR, "btc_prices.json"), "w") as f:
         json.dump(btc_prices, f)
-    print(f"\n  结果: {out_dir}/")
+    print(f"\n  结果: {OUT_DIR}/")
 
     # ─── 5. Dashboard ───
     print("\n[4] 生成对比看板...")
@@ -229,8 +294,9 @@ def main():
     print(f"  看板: {html_path}")
 
     # ─── 6. 汇总 ───
+    elapsed_total = time.time() - t0
     print(f"\n{'='*60}")
-    print(f"  进化效果汇总 (精选20 · 15m · 每周反思)")
+    print(f"  进化效果汇总 (精选20 · v2新版反思 · {elapsed_total/60:.0f}分钟)")
     print(f"{'='*60}")
     print(f"  {'Bot':10s} {'来源':12s} {'无反思':>10s} {'有反思':>10s} "
           f"{'Δ':>8s} {'Sharpe变化':>14s} {'爆仓变化':>10s}")
@@ -255,6 +321,7 @@ def main():
               f"{blow_change:>8s}")
 
     print(f"\n  反思改善率: {improved}/{len(final)} ({improved/max(1,len(final))*100:.0f}%)")
+    print(f"  总耗时: {elapsed_total/60:.1f} 分钟")
     print("  完成!")
     sys.stdout.flush()
 

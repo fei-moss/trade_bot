@@ -837,10 +837,14 @@ canvas {{ width:100%!important; }}
          transition: border-color 0.2s; }}
 .card:hover {{ border-color:#58a6ff; }}
 .card h3 {{ font-size:0.95rem; margin-bottom:6px; }}
-.card .rea {{ color:#8b949e; font-size:0.78rem; font-style:italic; margin-bottom:10px;
-              line-height:1.4; }}
-.card .prompt-preview {{ color:#484f58; font-size:0.72rem; margin-bottom:8px;
-                         max-height:60px; overflow:hidden; line-height:1.3; }}
+.card-section {{ margin-bottom:10px; }}
+.card-section .sec-title {{ font-size:0.72rem; font-weight:600; color:#58a6ff;
+  text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;
+  padding-bottom:3px; border-bottom:1px solid #21262d; }}
+.card-section .sec-body {{ font-size:0.78rem; color:#8b949e; line-height:1.5;
+  white-space:pre-wrap; word-break:break-word; }}
+.card-section .sec-body.prompt {{ color:#484f58; max-height:80px; overflow-y:auto; }}
+.card-section .sec-body.personality {{ color:#c9d1d9; font-style:italic; }}
 .pgrid {{ display:grid; grid-template-columns:1fr 1fr; gap:3px 14px; font-size:0.78rem; }}
 .pgrid .l {{ color:#8b949e; }} .pgrid .v {{ text-align:right; }}
 
@@ -909,6 +913,8 @@ canvas {{ width:100%!important; }}
   <div class="toolbar">
     <h3 style="margin-right:8px">累计收益 (%) + BTC价格</h3>
     <div class="sep"></div>
+    <button id="btnScaleMode" style="background:#1f6feb;color:#fff;font-weight:600">📐 对数压缩</button>
+    <div class="sep"></div>
     <button id="btnAll">全选</button>
     <button id="btnInvert">反选</button>
     <button id="btnNone">清除</button>
@@ -925,8 +931,14 @@ canvas {{ width:100%!important; }}
 </div>
 
 <div class="box" style="margin-bottom:18px">
-  <h3 style="margin-bottom:8px">信号权重雷达图</h3>
-  <canvas id="radarChart" height="280"></canvas>
+  <div class="toolbar">
+    <h3 style="margin-right:8px">每周盈亏排行榜</h3>
+    <div class="sep"></div>
+    <button id="weekPrev">◀ 上周</button>
+    <span id="weekLabel" style="color:#c9d1d9;font-size:0.85rem;min-width:120px;text-align:center"></span>
+    <button id="weekNext">下周 ▶</button>
+  </div>
+  <div id="weekBoard" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px"></div>
 </div>
 
 <div class="cards" id="botCards"></div>
@@ -999,15 +1011,29 @@ const C = (function() {{
   }});
 }})();
 
-// ─── Equity Chart (zoomable + legend controls) ───
+// ─── Equity Chart (zoomable + legend controls + symlog) ───
 let eqChart;
 (function() {{
   const ctx = document.getElementById('eqChart').getContext('2d');
   const totalLen = B[0].equity.length;
   const labels = B[0].equity.map((_,i) => i);
+
+  const rawPcts = B.map(b => b.equity.map(v => ((v/b.equity[0])-1)*100));
+
+  function symlog(v) {{ return Math.sign(v) * Math.log10(1 + Math.abs(v)); }}
+  function symlogInv(v) {{ return Math.sign(v) * (Math.pow(10, Math.abs(v)) - 1); }}
+
+  function fmtPct(v) {{
+    if (Math.abs(v) >= 1000) return `${{v>=0?'+':''}}${{(v/1000).toFixed(1)}}k%`;
+    if (Math.abs(v) >= 100)  return `${{v>=0?'+':''}}${{v.toFixed(0)}}%`;
+    return `${{v>=0?'+':''}}${{v.toFixed(1)}}%`;
+  }}
+
+  let isSymlog = true;
+
   const ds = B.map((b,i) => ({{
     label: b.name,
-    data: b.equity.map(v => ((v/b.equity[0])-1)*100),
+    data: rawPcts[i].map(symlog),
     borderColor: C[i], borderWidth: 1.5, pointRadius: 0, fill: false, yAxisID:'y',
   }}));
   const step = Math.max(1, Math.floor(BTC.length / totalLen));
@@ -1016,6 +1042,10 @@ let eqChart;
     borderColor:'#484f58', borderWidth:1.2, borderDash:[4,3], pointRadius:0,
     fill:false, yAxisID:'y1',
   }});
+  const barsPerDay = totalLen > 10000 ? 96 : totalLen > 4000 ? 24 : 6;
+
+  const symlogTicks = [-10000,-5000,-1000,-500,-100,-50,0,50,100,500,1000,5000,10000].map(symlog);
+
   eqChart = new Chart(ctx, {{
     type:'line', data:{{ labels, datasets:ds }},
     options:{{
@@ -1023,6 +1053,21 @@ let eqChart;
       interaction:{{ mode:'index', intersect:false }},
       plugins:{{
         legend:{{ labels:{{ color:'#8b949e', font:{{size:10}}, boxWidth:12 }}, position:'bottom' }},
+        tooltip:{{
+          callbacks:{{
+            title: items => {{
+              const idx = items[0].parsed.x;
+              const day = Math.floor(idx / barsPerDay);
+              return `第 ${{day}} 天 (bar ${{idx}})`;
+            }},
+            label: item => {{
+              const dsIdx = item.datasetIndex;
+              if (dsIdx === ds.length - 1) return `BTC: $${{item.parsed.y.toLocaleString()}}`;
+              const rawVal = isSymlog ? symlogInv(item.parsed.y) : item.parsed.y;
+              return `${{item.dataset.label}}: ${{fmtPct(rawVal)}}`;
+            }},
+          }},
+        }},
         zoom:{{
           pan:{{ enabled:true, mode:'x', onPanComplete:syncSlider }},
           zoom:{{
@@ -1035,15 +1080,36 @@ let eqChart;
       }},
       scales:{{
         x:{{ type:'linear', display:true, min:0, max:totalLen-1,
-             ticks:{{ color:'#484f58', maxTicksLimit:12, callback:v=>v }},
+             ticks:{{ color:'#484f58', maxTicksLimit:12,
+               callback: v => {{ const d=Math.floor(v/barsPerDay); return d%7===0?`${{d}}天`:''; }} }},
              grid:{{ color:'#21262d33' }} }},
-        y:{{ position:'left', title:{{display:true,text:'收益 %',color:'#8b949e'}},
-             ticks:{{color:'#8b949e'}}, grid:{{color:'#21262d'}} }},
+        y:{{ position:'left', title:{{display:true,text:'收益 % (对数压缩)',color:'#8b949e'}},
+             ticks:{{
+               color:'#8b949e',
+               callback: v => fmtPct(isSymlog ? symlogInv(v) : v),
+               autoSkip: true,
+               maxTicksLimit: 14,
+             }},
+             grid:{{color:'#21262d'}} }},
         y1:{{ position:'right', title:{{display:true,text:'BTC $',color:'#484f58'}},
-              ticks:{{color:'#484f58'}}, grid:{{display:false}} }},
+              ticks:{{color:'#484f58', callback:v=>`$${{(v/1000).toFixed(0)}}k`}}, grid:{{display:false}} }},
       }},
     }},
   }});
+
+  // ─ Scale mode toggle ─
+  const btnScale = document.getElementById('btnScaleMode');
+  btnScale.onclick = () => {{
+    isSymlog = !isSymlog;
+    const botDs = ds.length - 1;
+    for (let di = 0; di < botDs; di++) {{
+      ds[di].data = isSymlog ? rawPcts[di].map(symlog) : rawPcts[di].slice();
+    }}
+    eqChart.options.scales.y.title.text = isSymlog ? '收益 % (对数压缩)' : '收益 %';
+    btnScale.textContent = isSymlog ? '📐 对数压缩' : '📏 线性';
+    btnScale.style.background = isSymlog ? '#1f6feb' : '#238836';
+    eqChart.update();
+  }};
 
   // ─ Range slider ─
   const slMin = document.getElementById('rangeMin');
@@ -1101,27 +1167,77 @@ let eqChart;
   }};
 }})();
 
-// ─── Radar ───
+// ─── Weekly Leaderboard ───
 (function() {{
-  const ctx = document.getElementById('radarChart').getContext('2d');
-  const labels = ['趋势','动量','均值回归','量能','波动率'];
-  const ds = B.map((b,i) => ({{
-    label: b.name,
-    data:[b.params.trend_weight, b.params.momentum_weight,
-          b.params.mean_revert_weight, b.params.volume_weight, b.params.volatility_weight],
-    borderColor:C[i], backgroundColor:C[i]+'22', borderWidth:1.5, pointRadius:2,
-  }}));
-  new Chart(ctx, {{
-    type:'radar', data:{{ labels, datasets:ds }},
-    options:{{
-      responsive:true,
-      plugins:{{ legend:{{ labels:{{ color:'#8b949e', font:{{size:10}}, boxWidth:12 }},
-                          position:'bottom' }} }},
-      scales:{{ r:{{ beginAtZero:true, max:0.65,
-        ticks:{{color:'#8b949e',backdropColor:'transparent'}},
-        grid:{{color:'#21262d'}}, pointLabels:{{color:'#c9d1d9',font:{{size:11}}}} }} }},
-    }},
-  }});
+  const barsPerWeek = 672;
+  const totalLen = B[0].equity.length;
+  const nWeeks = Math.ceil(totalLen / barsPerWeek);
+
+  function calcWeekReturns(weekIdx) {{
+    const start = weekIdx * barsPerWeek;
+    const end = Math.min(start + barsPerWeek, totalLen - 1);
+    return B.map((b, i) => {{
+      const eq = b.equity;
+      const s = eq[start] || 1;
+      const e = eq[end] || s;
+      return {{ name: b.name, idx: i, ret: (e / s - 1) * 100 }};
+    }});
+  }}
+
+  let curWeek = 0;
+
+  function renderWeek(weekIdx) {{
+    const board = document.getElementById('weekBoard');
+    const label = document.getElementById('weekLabel');
+    const rets = calcWeekReturns(weekIdx);
+    const sorted = [...rets].sort((a, b) => b.ret - a.ret);
+
+    const weekStart = weekIdx * barsPerWeek;
+    const weekEnd = Math.min(weekStart + barsPerWeek, totalLen - 1);
+    const btcStart = BTC[Math.min(weekStart, BTC.length - 1)] || 1;
+    const btcEnd = BTC[Math.min(weekEnd, BTC.length - 1)] || btcStart;
+    const btcRet = ((btcEnd / btcStart) - 1) * 100;
+    const btcCls = btcRet >= 0 ? 'pos' : 'neg';
+    label.innerHTML = `第 ${{weekIdx + 1}}/${{nWeeks}} 周 &nbsp;·&nbsp; BTC <span class="${{btcCls}}">${{btcRet >= 0 ? '+' : ''}}${{btcRet.toFixed(1)}}%</span>`;
+
+    const top = sorted.filter(x => x.ret >= 0).slice(0, 10);
+    const bottom = [...sorted].reverse().filter(x => x.ret < 0).slice(0, 10);
+
+    function makeRows(list, isTop) {{
+      if (!list.length) return '<tr><td colspan="3" style="color:#484f58">无</td></tr>';
+      return list.map((x, rank) => {{
+        const cls = x.ret >= 0 ? 'pos' : 'neg';
+        const medal = rank === 0 ? (isTop ? '🥇' : '💀') : rank === 1 ? (isTop ? '🥈' : '☠️') : rank === 2 ? (isTop ? '🥉' : '🩸') : '';
+        return `<tr>
+          <td style="text-align:left"><span class="dot" style="background:${{C[x.idx]}}"></span>${{medal}} ${{x.name}}</td>
+          <td class="${{cls}}" style="font-weight:600">${{x.ret >= 0 ? '+' : ''}}${{x.ret.toFixed(1)}}%</td>
+        </tr>`;
+      }}).join('');
+    }}
+
+    board.innerHTML = `
+      <div>
+        <h4 style="color:#3fb950;font-size:0.82rem;margin-bottom:6px">🏆 盈利榜</h4>
+        <table style="width:100%;font-size:0.8rem;border-collapse:collapse">
+          <tbody>${{makeRows(top, true)}}</tbody>
+        </table>
+      </div>
+      <div>
+        <h4 style="color:#f85149;font-size:0.82rem;margin-bottom:6px">📉 亏损榜</h4>
+        <table style="width:100%;font-size:0.8rem;border-collapse:collapse">
+          <tbody>${{makeRows(bottom, false)}}</tbody>
+        </table>
+      </div>
+    `;
+  }}
+
+  document.getElementById('weekPrev').onclick = () => {{
+    if (curWeek > 0) {{ curWeek--; renderWeek(curWeek); }}
+  }};
+  document.getElementById('weekNext').onclick = () => {{
+    if (curWeek < nWeeks - 1) {{ curWeek++; renderWeek(curWeek); }}
+  }};
+  renderWeek(0);
 }})();
 
 // ─── Bot Cards ───
@@ -1131,7 +1247,6 @@ let eqChart;
     const p = b.params, r = b.result;
     const bias = p.long_bias;
     const dir = bias>0.7?'只做多':(bias<0.3?'只做空':'双向');
-    const promptLines = b.prompt.split('\\n').filter(l=>l.trim()).slice(0,4).join('<br>');
     let trHtml = '';
     if (b.trades && b.trades.length) {{
       const rows = b.trades.slice(0,30).map(t => {{
@@ -1151,20 +1266,101 @@ let eqChart;
     const blowInfo = blow > 0
       ? `<div style="background:#f8514920;border:1px solid #f85149;border-radius:6px;padding:6px 10px;margin:8px 0;font-size:0.82rem">💥 <b>爆仓 ${{blow}} 次</b> | 累计投入 ${{(r.total_deposited||10000).toLocaleString()}} | 每次复活重置 $10,000</div>`
       : '';
+    const promptText = (b.prompt||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+    // ─── 策略解读：从参数推导可读描述 ───
+    const dirLabel = p.long_bias>0.7?'做多为主':(p.long_bias<0.3?'做空为主':'多空双向');
+    const levLabel = p.base_leverage>=50?'极高杠杆':(p.base_leverage>=20?'高杠杆':(p.base_leverage>=10?'中等杠杆':'低杠杆'));
+    const entryLabel = p.entry_threshold>=0.4?'极保守(少交易)':(p.entry_threshold>=0.25?'中性':'激进(多交易)');
+    const ws = [
+      {{n:'趋势',w:p.trend_weight}}, {{n:'动量',w:p.momentum_weight}},
+      {{n:'均值回归',w:p.mean_revert_weight}}, {{n:'量能',w:p.volume_weight}},
+      {{n:'波动率',w:p.volatility_weight}}
+    ].sort((a,b)=>b.w-a.w);
+    const topSigs = ws.filter(x=>x.w>0.1).map(x=>`${{x.n}}(${{(x.w*100).toFixed(0)}}%)`).join(' > ');
+    const slRisk = (p.sl_atr_mult * 1.5 * p.base_leverage).toFixed(0);
+    const rollDesc = p.rolling_enabled
+      ? `浮盈${{(p.rolling_trigger_pct*100).toFixed(0)}}%触发, 用${{(p.rolling_reinvest_pct*100).toFixed(0)}}%浮盈加仓, 最多${{p.rolling_max_times}}次`
+      : '不滚仓';
+
+    const totalBars = (b.equity||[]).length || 1;
+    const tradeDays = totalBars / 96;
+    const tradesPerDay = r.total_trades / (tradeDays||1);
+    const freqLabel = tradesPerDay>=5?'极高频(>5笔/天)':(tradesPerDay>=2?'高频(2-5笔/天)':(tradesPerDay>=0.5?'中频(隔天1笔)':(tradesPerDay>=0.15?'低频(数天1笔)':'极低频(<周1笔)')));
+
+    const strategyLines = [
+      `<b>方向:</b> ${{dirLabel}} (long_bias=${{p.long_bias.toFixed(2)}})`,
+      `<b>杠杆:</b> ${{levLabel}} ${{p.base_leverage.toFixed(0)}}x (最大${{p.max_leverage.toFixed(0)}}x)`,
+      `<b>入场:</b> threshold=${{p.entry_threshold.toFixed(2)}} → ${{entryLabel}}`,
+      `<b>交易频率:</b> ${{r.total_trades}}笔/${{tradeDays.toFixed(0)}}天 (${{tradesPerDay.toFixed(1)}}笔/天) → ${{freqLabel}}`,
+      `<b>信号优先级:</b> ${{topSigs}}`,
+      `<b>风控:</b> 止损${{p.sl_atr_mult.toFixed(1)}}ATR (≈单笔最大亏${{slRisk}}%) | 止盈RR=${{p.tp_rr_ratio.toFixed(1)}} | 移动止损${{p.trailing_enabled?'开':'关'}}`,
+      `<b>滚仓:</b> ${{rollDesc}}`,
+      `<b>仓位:</b> 每笔${{(p.risk_per_trade*100).toFixed(0)}}%资金, 单笔上限${{(p.max_position_pct*100).toFixed(0)}}%`,
+      `<b>Regime:</b> 敏感度${{p.regime_sensitivity.toFixed(2)}} | 切换时${{p.exit_on_regime_change?'平仓':'持有'}}`,
+    ].join('<br>');
+
+    // ─── 进化历程 ───
+    let evoHtml = '';
+    const evoLog = b.evolution_log || [];
+    if (evoLog.length) {{
+      const evoRows = evoLog.map((e,ei) => {{
+        const retCls = e.segment_return>=0?'pos':'neg';
+        const changes = e.key_changes ? Object.entries(e.key_changes).map(([k,v])=>`${{k}}: ${{v}}`).join(', ') : '无调整';
+        return `<tr>
+          <td>#${{e.generation}}</td>
+          <td class="${{retCls}}">${{(e.segment_return*100).toFixed(1)}}%</td>
+          <td>${{e.trades_count}}笔</td>
+          <td style="text-align:left;font-size:0.7rem;color:#8b949e">${{changes}}</td>
+        </tr>`;
+      }}).join('');
+      evoHtml = `<div class="card-section">
+        <div class="sec-title">📈 进化历程 (${{evoLog.length}}轮)</div>
+        <div class="tlist" style="max-height:160px"><table>
+          <thead><tr><th>轮次</th><th>收益</th><th>交易</th><th>参数调整</th></tr></thead>
+          <tbody>${{evoRows}}</tbody></table></div>
+      </div>`;
+    }}
+
     ct.innerHTML += `<div class="card">
       <h3 style="border-left:3px solid ${{C[i]}};padding-left:10px">${{b.name}}</h3>
       ${{blowInfo}}
-      <div class="rea">${{b.reasoning}}</div>
-      <div class="prompt-preview">${{promptLines}}</div>
-      <div class="pgrid">
-        <span class="l">杠杆</span><span class="v">${{p.base_leverage.toFixed(0)}}x</span>
-        <span class="l">方向</span><span class="v">${{dir}}</span>
-        <span class="l">仓位</span><span class="v">${{(p.risk_per_trade*100).toFixed(0)}}%</span>
-        <span class="l">阈值</span><span class="v">${{p.entry_threshold.toFixed(2)}}</span>
-        <span class="l">止损</span><span class="v">${{p.sl_atr_mult.toFixed(1)}} ATR</span>
-        <span class="l">止盈RR</span><span class="v">${{p.tp_rr_ratio.toFixed(1)}}</span>
-        <span class="l">移动止损</span><span class="v">${{p.trailing_enabled?'开':'关'}}</span>
-        <span class="l">滚仓</span><span class="v">${{p.rolling_enabled?'开('+((p.rolling_trigger_pct*100).toFixed(0))+'%)':'关'}}</span>
+      <div class="card-section">
+        <div class="sec-title">📝 输入 Prompt</div>
+        <div class="sec-body prompt">${{promptText||'(无)'}}</div>
+      </div>
+      <div class="card-section">
+        <div class="sec-title">🧠 策略解读</div>
+        <div class="sec-body" style="font-size:0.78rem;line-height:1.6">${{strategyLines}}</div>
+      </div>
+      ${{evoHtml}}
+      <div class="card-section">
+        <div class="sec-title">⚙️ 完整参数</div>
+        <div class="pgrid">
+          <span class="l">趋势权重 trend_weight</span><span class="v">${{p.trend_weight.toFixed(3)}}</span>
+          <span class="l">动量权重 momentum_weight</span><span class="v">${{p.momentum_weight.toFixed(3)}}</span>
+          <span class="l">均值回归 mean_revert_weight</span><span class="v">${{p.mean_revert_weight.toFixed(3)}}</span>
+          <span class="l">量能权重 volume_weight</span><span class="v">${{p.volume_weight.toFixed(3)}}</span>
+          <span class="l">波动率权重 volatility_weight</span><span class="v">${{p.volatility_weight.toFixed(3)}}</span>
+          <span class="l">入场阈值 entry_threshold</span><span class="v">${{p.entry_threshold.toFixed(3)}}</span>
+          <span class="l">出场阈值 exit_threshold</span><span class="v">${{p.exit_threshold.toFixed(3)}}</span>
+          <span class="l">方向偏好 long_bias</span><span class="v">${{p.long_bias.toFixed(3)}}</span>
+          <span class="l">基础杠杆 base_leverage</span><span class="v">${{p.base_leverage.toFixed(1)}}x</span>
+          <span class="l">最大杠杆 max_leverage</span><span class="v">${{p.max_leverage.toFixed(1)}}x</span>
+          <span class="l">单笔仓位 risk_per_trade</span><span class="v">${{p.risk_per_trade.toFixed(3)}}</span>
+          <span class="l">最大仓位 max_position_pct</span><span class="v">${{p.max_position_pct.toFixed(3)}}</span>
+          <span class="l">止损距离 sl_atr_mult</span><span class="v">${{p.sl_atr_mult.toFixed(2)}} ATR</span>
+          <span class="l">止盈比 tp_rr_ratio</span><span class="v">${{p.tp_rr_ratio.toFixed(2)}}</span>
+          <span class="l">移动止损 trailing_enabled</span><span class="v">${{p.trailing_enabled?'开':'关'}}</span>
+          <span class="l">激活浮盈 trailing_activation</span><span class="v">${{(p.trailing_activation_pct*100).toFixed(1)}}%</span>
+          <span class="l">跟踪距离 trailing_distance</span><span class="v">${{p.trailing_distance_atr.toFixed(2)}} ATR</span>
+          <span class="l">滚仓开关 rolling_enabled</span><span class="v">${{p.rolling_enabled?'开':'关'}}</span>
+          <span class="l">滚仓触发 rolling_trigger</span><span class="v">${{(p.rolling_trigger_pct*100).toFixed(0)}}%</span>
+          <span class="l">滚仓再投 rolling_reinvest</span><span class="v">${{(p.rolling_reinvest_pct*100).toFixed(0)}}%</span>
+          <span class="l">最大滚仓 rolling_max_times</span><span class="v">${{p.rolling_max_times}}次</span>
+          <span class="l">行情敏感 regime_sensitivity</span><span class="v">${{p.regime_sensitivity.toFixed(3)}}</span>
+          <span class="l">切换平仓 exit_on_regime</span><span class="v">${{p.exit_on_regime_change?'是':'否'}}</span>
+        </div>
       </div>
       ${{trHtml}}
     </div>`;

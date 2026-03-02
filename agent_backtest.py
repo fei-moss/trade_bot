@@ -454,6 +454,7 @@ def run_with_reflection(
                     cumulative_context=cumulative_context,
                     initial_params=initial_params,
                 )
+                _lock_personality(new_params, initial_params)
                 old_params = current_params
                 current_params = new_params
 
@@ -483,6 +484,23 @@ def run_with_reflection(
                                initial_capital=initial_capital,
                                precomputed_signals=all_signals)
     return final, evolution_log
+
+
+PERSONALITY_FIELDS = [
+    "long_bias",
+    "base_leverage", "max_leverage",
+    "risk_per_trade", "max_position_pct",
+    "rolling_enabled", "rolling_trigger_pct", "rolling_reinvest_pct",
+    "rolling_max_times", "rolling_move_stop",
+    "trend_weight", "momentum_weight", "mean_revert_weight",
+    "volume_weight", "volatility_weight",
+]
+
+
+def _lock_personality(new_params: DecisionParams, initial_params: DecisionParams):
+    """反思后强制锁定性格参数，只允许 LLM 调整战术参数。"""
+    for field in PERSONALITY_FIELDS:
+        setattr(new_params, field, getattr(initial_params, field))
 
 
 def _param_diff(old: DecisionParams, new: DecisionParams) -> dict:
