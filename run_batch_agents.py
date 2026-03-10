@@ -663,7 +663,7 @@ def main():
         print(f"\n  {tag} {bot['name']} ({bot['id']})...")
 
         try:
-            params, reasoning = tuner.tune(bot["prompt"], market_context=ctx)
+            params, reasoning = tuner.tune(bot["prompt"])
         except Exception as e:
             print(f"    ✗ LLM 调用失败: {e}")
             continue

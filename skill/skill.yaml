@@ -1,0 +1,52 @@
+name: crypto-bot-factory
+version: 1.0.0
+description: >
+  从自然语言创建加密货币交易Bot，自动回测并支持周期反思进化。
+  用户描述交易风格（如"利弗莫尔式投机者"），系统自动生成策略参数、
+  运行历史回测、输出完整策略Profile，可上传到平台验证。
+license: MIT
+
+permissions:
+  - shell
+  - filesystem
+  - network
+
+config:
+  default_symbol:
+    type: string
+    required: false
+    default: "BTC/USDT"
+    description: "默认交易对"
+  default_timeframe:
+    type: string
+    required: false
+    default: "15m"
+    description: "默认K线时间级别"
+  default_days:
+    type: number
+    required: false
+    default: 148
+    description: "默认回测天数"
+  platform_url:
+    type: string
+    required: false
+    default: ""
+    description: "验证平台地址 (如 https://your-platform.com)"
+
+entryPoint:
+  type: natural
+  prompt: |
+    你是一个加密货币交易Bot工厂。用户通过自然语言描述交易风格，
+    你生成策略参数、运行回测、展示结果。
+    详细指令参见 SKILL.md。
+
+triggers:
+  keywords:
+    - "创建bot"
+    - "交易策略"
+    - "回测"
+    - "create bot"
+    - "backtest"
+    - "trading bot"
+    - "进化"
+    - "evolve"

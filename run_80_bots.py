@@ -134,7 +134,7 @@ def main():
     for i, desc in enumerate(USER_DESCRIPTIONS):
         tag = f"[{i+1}/{n}]"
         try:
-            bot = designer.design(desc, market_context=ctx)
+            bot = designer.design(desc)
             p = bot["params"]
             dir_str = "做多" if p.long_bias > 0.7 else ("做空" if p.long_bias < 0.3 else "双向")
             print(f"  {tag} {bot['name']:6s} ← \"{desc[:20]}...\" | "

@@ -50,6 +50,7 @@ def run_agent_backtest(
     """
     df = df.copy().reset_index(drop=True)
     regime = regime.reset_index(drop=True)
+    has_ts = "timestamp" in df.columns
 
     if precomputed_signals is not None:
         signals = precomputed_signals.reset_index(drop=True)
@@ -148,6 +149,7 @@ def run_agent_backtest(
                 pnl = pos.margin * pnl_pct
                 pos.exit_idx = i
                 pos.exit_price = exit_price
+                pos.exit_time = str(df["timestamp"].iloc[i]) if has_ts else None
                 pos.pnl = pnl
                 pos.pnl_pct = pnl_pct
                 pos.exit_reason = exit_reason
@@ -189,6 +191,7 @@ def run_agent_backtest(
                             margin=new_margin,
                             sl_price=sl_p,
                             tp_price=tp_p,
+                            entry_time=str(df["timestamp"].iloc[i]) if has_ts else None,
                         )
                         capital -= new_margin
                         positions.append(new_pos)
@@ -224,6 +227,7 @@ def run_agent_backtest(
                     margin=margin,
                     sl_price=sl_p,
                     tp_price=tp_p,
+                    entry_time=str(df["timestamp"].iloc[i]) if has_ts else None,
                 )
                 capital -= margin
                 positions.append(pos)
@@ -244,6 +248,7 @@ def run_agent_backtest(
         pnl_pct = max(pnl_pct, -1.0)
         pos.exit_idx = len(df) - 1
         pos.exit_price = price
+        pos.exit_time = str(df["timestamp"].iloc[-1]) if has_ts else None
         pos.pnl = pos.margin * pnl_pct
         pos.pnl_pct = pnl_pct
         pos.exit_reason = "end_of_data"
@@ -547,17 +552,12 @@ def main():
     for r, s in summary.items():
         print(f"  {r}: {s['pct']:.0%}")
 
-    # LLM 生成初始参数
+    # LLM 生成初始参数（不传行情上下文，避免对历史数据过拟合）
     print(f"\n[2] LLM 生成策略参数...")
-    from src.generator.llm_tuner import LLMTuner, format_market_context
-
-    warmup = min(720, len(df))
-    warmup_df = df.iloc[:warmup]
-    warmup_regime = regime.iloc[:warmup]
-    ctx = format_market_context(warmup_df, warmup_regime)
+    from src.generator.llm_tuner import LLMTuner
 
     tuner = LLMTuner(model=args.model)
-    params, reasoning = tuner.tune(args.prompt, market_context=ctx)
+    params, reasoning = tuner.tune(args.prompt)
     print(f"  LLM理由: {reasoning}")
     print(f"  关键参数:")
     print(f"    趋势权重={params.trend_weight:.2f} 动量={params.momentum_weight:.2f} "
@@ -598,7 +598,6 @@ def main():
                     seg_df = df.iloc[max(0, start-200):start]
                     seg_regime = regime.iloc[max(0, start-200):start]
                     if len(seg_df) > 50:
-                        ctx = format_market_context(seg_df, seg_regime)
                         perf_str = ""
                         if all_params:
                             prev_start, prev_end, prev_params = all_params[-1]
@@ -615,7 +614,6 @@ def main():
 
                         new_params, new_reason = tuner.tune(
                             args.prompt,
-                            market_context=ctx,
                             current_params=current_params,
                             recent_performance=perf_str,
                         )

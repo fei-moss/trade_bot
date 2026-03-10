@@ -19,7 +19,7 @@ from openai import OpenAI
 from src.strategy.decision import DecisionParams
 
 
-DEFAULT_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4.6")
 
 SYSTEM_PROMPT = """你是一个专业的量化交易策略调参师。
 
@@ -104,13 +104,16 @@ SYSTEM_PROMPT = """你是一个专业的量化交易策略调参师。
 只需要输出你想要修改的参数，未提及的保持默认值。"""
 
 
+DEFAULT_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+
+
 class LLMTuner:
-    def __init__(self, model: str = DEFAULT_MODEL):
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    def __init__(self, model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL):
+        api_key = os.environ.get("LLM_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
-            raise EnvironmentError("需要设置 OPENROUTER_API_KEY 环境变量")
+            raise EnvironmentError("需要设置 LLM_API_KEY 或 OPENROUTER_API_KEY 环境变量")
         self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
+            base_url=base_url,
             api_key=api_key,
         )
         self.model = model

@@ -1,10 +1,30 @@
 services:
-  trade-bot:
-    build: .
-    container_name: trade-bot
-    volumes:
-      - ./profiles:/app/profiles
-      - ./data_cache:/app/data_cache
+  postgres:
+    image: postgres:16-alpine
     environment:
-      - PYTHONUNBUFFERED=1
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      POSTGRES_DB: trade_bot
+      POSTGRES_USER: trade_bot
+      POSTGRES_PASSWORD: trade_bot_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  platform:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://trade_bot:trade_bot_dev@postgres:5432/trade_bot
+      DATABASE_URL_SYNC: postgresql+psycopg2://trade_bot:trade_bot_dev@postgres:5432/trade_bot
+    volumes:
+      - .:/app
+      - data_cache:/app/data_cache
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:
+  data_cache:
